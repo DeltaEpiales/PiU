@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Pi-hole Admin Toolkit v3.0 (Final)
+# Pi-hole Admin Toolkit v4.0 (Definitive Edition)
 # A comprehensive, menu-driven script for managing and troubleshooting a Pi-hole instance.
-# Enhanced with a guided setup, error checking, and advanced utilities.
+# Enhanced with a guided setup, static IP configuration, error checking, and advanced utilities.
 
 # --- Color Definitions ---
 GREEN='\033[0;32m'
@@ -28,6 +28,68 @@ check_dependency() {
     fi
 }
 
+# --- IP Configuration ---
+manage_ip_configuration() {
+    clear
+    echo "========================================"
+    echo "  Set Static IP Address"
+    echo "========================================"
+    echo "This tool will configure a static IP in /etc/dhcpcd.conf."
+    echo -e "${RED}A static IP is CRUCIAL for Pi-hole to work reliably.${NC}"
+    
+    read -p "Which interface do you want to configure? (eth0 for wired, wlan0 for wireless): " interface
+    if [[ "$interface" != "eth0" && "$interface" != "wlan0" ]]; then
+        echo -e "${RED}Invalid interface. Please choose 'eth0' or 'wlan0'.${NC}"
+        press_enter_to_continue
+        return
+    fi
+
+    echo -e "\nPlease provide the network details:"
+    read -p "Static IP address (e.g., 192.168.1.10): " ip_address
+    read -p "Subnet mask in CIDR format (e.g., 24): " cidr
+    read -p "Gateway/Router IP address (e.g., 192.168.1.1): " gateway
+
+    # Validate input
+    if [[ -z "$ip_address" || -z "$cidr" || -z "$gateway" ]]; then
+        echo -e "${RED}All fields are required. Aborting.${NC}"
+        press_enter_to_continue
+        return
+    fi
+    
+    echo -e "\n${YELLOW}Configuration to be applied for interface '$interface':${NC}"
+    echo "IP Address:   $ip_address/$cidr"
+    echo "Gateway:      $gateway"
+    
+    read -p "Are you sure you want to apply these settings? (y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Backing up /etc/dhcpcd.conf to /etc/dhcpcd.conf.bak..."
+        sudo cp /etc/dhcpcd.conf /etc/dhcpcd.conf.bak
+        
+        # Remove any existing static configurations for the interface to avoid conflicts
+        sudo sed -i "/^interface $interface/,/^\s*$/d" /etc/dhcpcd.conf
+
+        echo "Applying new configuration..."
+        {
+            echo ""
+            echo "interface $interface"
+            echo "    static ip_address=$ip_address/$cidr"
+            echo "    static routers=$gateway"
+            echo "    static domain_name_servers=127.0.0.1"
+        } | sudo tee -a /etc/dhcpcd.conf > /dev/null
+
+        echo -e "\n${GREEN}Configuration applied successfully!${NC}"
+        echo -e "${RED}A system reboot is required for these changes to take effect.${NC}"
+        read -p "Do you want to reboot now? (y/N): " reboot_choice
+        if [[ "$reboot_choice" =~ ^[Yy]$ ]]; then
+            sudo reboot
+        fi
+    else
+        echo "Operation cancelled."
+    fi
+    press_enter_to_continue
+}
+
+
 # --- Guided Configuration ---
 run_guided_configuration() {
     clear
@@ -40,12 +102,10 @@ run_guided_configuration() {
     echo -e "\n${BLUE}Step 1: Checking Network Configuration...${NC}"
     if ! grep -q "static ip_address" /etc/dhcpcd.conf; then
         echo -e "${YELLOW}Warning: Your Pi-hole does not appear to have a static IP set in /etc/dhcpcd.conf.${NC}"
-        echo "A static IP is crucial for Pi-hole to function correctly."
-        read -p "Would you like to run the Pi-hole reconfigure tool to set one now? (y/N): " choice
+        echo "This is the most common cause of Pi-hole failure after a reboot."
+        read -p "Would you like to configure a static IP now? (y/N): " choice
         if [[ "$choice" =~ ^[Yy]$ ]]; then
-            pihole -r
-            echo "Please re-run this script after the reconfiguration is complete."
-            exit 0
+            manage_ip_configuration
         fi
     else
         echo -e "${GREEN}Static IP configuration found in /etc/dhcpcd.conf.${NC}"
@@ -56,32 +116,12 @@ run_guided_configuration() {
     upstream_dns=$(grep 'PIHOLE_DNS_' /etc/pihole/setupVars.conf | cut -d'=' -f2)
     if [[ -z "$upstream_dns" ]]; then
         echo -e "${RED}Error: No upstream DNS servers are configured!${NC}"
-        echo "Pi-hole needs at least one upstream DNS server to resolve domains."
-        read -p "Would you like to run the Pi-hole reconfigure tool to set them now? (y/N): " choice
-        if [[ "$choice" =~ ^[Yy]$ ]]; then
-            pihole -r
-            echo "Please re-run this script after the reconfiguration is complete."
-            exit 0
-        fi
+        read -p "Run Pi-hole reconfigure to set them now? (y/N): " choice
+        if [[ "$choice" =~ ^[Yy]$ ]]; then pihole -r; fi
     else
         echo -e "${GREEN}Upstream DNS servers found:${NC}\n$upstream_dns"
     fi
     
-    # 3. Check DHCP Server Status
-    echo -e "\n${BLUE}Step 3: Checking DHCP Server...${NC}"
-    if grep -q 'DHCP_ACTIVE=true' /etc/pihole/setupVars.conf; then
-        echo -e "${GREEN}Pi-hole's DHCP server is enabled.${NC}"
-        dhcp_start=$(grep 'DHCP_START' /etc/pihole/setupVars.conf | cut -d'=' -f2)
-        dhcp_end=$(grep 'DHCP_END' /etc/pihole/setupVars.conf | cut -d'=' -f2)
-        dhcp_router=$(grep 'DHCP_ROUTER' /etc/pihole/setupVars.conf | cut -d'=' -f2)
-        echo "DHCP Range: $dhcp_start to $dhcp_end"
-        echo "Gateway: $dhcp_router"
-        echo -e "${YELLOW}Important: Make sure you have disabled the DHCP server on your main router!${NC}"
-    else
-        echo -e "${BLUE}Pi-hole's DHCP server is disabled.${NC}"
-        echo "Ensure your router's DHCP settings are pointing to this Pi-hole's IP for DNS."
-    fi
-
     echo -e "\n${GREEN}Guided configuration check complete!${NC}"
     press_enter_to_continue
 }
@@ -148,7 +188,6 @@ audit_adlists() {
     unreachable_count=0
     while IFS= read -r line; do
         if [[ -n "$line" && ! "$line" =~ ^# ]]; then
-            # Use curl to check the HTTP status code
             status_code=$(curl -o /dev/null --silent --head --write-out '%{http_code}' --max-time 10 "$line")
             if [[ "$status_code" -ne 200 ]]; then
                 echo -e "${RED}Unreachable:${NC} $line (Status: $status_code)"
@@ -160,7 +199,7 @@ audit_adlists() {
     if [[ "$unreachable_count" -eq 0 ]]; then
         echo -e "\n${GREEN}All adlists are reachable.${NC}"
     else
-        echo -e "\n${YELLOW}Found $unreachable_count unreachable adlist(s). Consider removing them from ${ADLIST_FILE}.${NC}"
+        echo -e "\n${YELLOW}Found $unreachable_count unreachable adlist(s). Consider removing them.${NC}"
     fi
     press_enter_to_continue
 }
@@ -195,8 +234,7 @@ manage_lists() {
                 read -p "Enter the full URL of the adlist: " adlist_url
                 if [[ -n "$adlist_url" ]]; then
                     echo "$adlist_url" | sudo tee -a /etc/pihole/adlists.list > /dev/null
-                    echo "Adlist added to /etc/pihole/adlists.list."
-                    echo "Remember to Update Gravity to apply changes."
+                    echo "Adlist added. Remember to Update Gravity."
                 fi
                 press_enter_to_continue
                 ;;
@@ -212,9 +250,7 @@ manage_lists() {
                 break
                 ;;
             *)
-                echo -e "${RED}Invalid option. Please try again.${NC}"
-                sleep 1
-                ;;
+                echo -e "${RED}Invalid option. Please try again.${NC}"; sleep 1 ;;
         esac
     done
 }
@@ -251,7 +287,7 @@ network_and_log_tools() {
                 if [[ -n "$client_ip" ]]; then
                     clear
                     echo "--- Recent queries for $client_ip (last 100) ---"
-                    echo "SELECT timestamp, type, domain, status FROM queries WHERE client='$client_ip' ORDER BY timestamp DESC LIMIT 100;" | sqlite3 /etc/pihole/pihole-FTL.db
+                    echo "SELECT strftime('%Y-%m-%d %H:%M:%S', timestamp), domain, type, status FROM queries WHERE client='$client_ip' ORDER BY timestamp DESC LIMIT 100;" | sqlite3 /etc/pihole/pihole-FTL.db | while IFS="|" read -r ts dom typ stat; do printf "%-20s %-50s %-5s %s\n" "$ts" "$dom" "$typ" "$stat"; done
                 fi
                 press_enter_to_continue
                 ;;
@@ -306,25 +342,28 @@ system_and_maintenance() {
         echo "========================================"
         echo "  System & Maintenance"
         echo "========================================"
-        echo "1. Update Pi-hole software (pihole -up)"
-        echo "2. Change Pi-hole Hostname"
-        echo "3. Backup / Restore Pi-hole (Teleporter)"
-        echo -e "${PURPLE}4. Flush Pi-hole Logs & Network Table${NC}"
-        echo "5. Run a debug session (pihole -d)"
-        echo -e "${RED}6. Reboot System${NC}"
-        echo -e "${RED}7. Shutdown System${NC}"
-        echo "8. Back to Main Menu"
+        echo -e "${PURPLE}1. Set Static IP Address${NC}"
+        echo "2. Update Pi-hole software (pihole -up)"
+        echo "3. Change Pi-hole Hostname"
+        echo "4. Backup / Restore Pi-hole (Teleporter)"
+        echo "5. Flush Pi-hole Logs & Network Table"
+        echo "6. Run a debug session (pihole -d)"
+        echo -e "${RED}7. Reboot System${NC}"
+        echo -e "${RED}8. Shutdown System${NC}"
+        echo "9. Back to Main Menu"
         echo "----------------------------------------"
-        read -p "Enter your choice [1-8]: " choice
+        read -p "Enter your choice [1-9]: " choice
 
         case $choice in
             1)
-                pihole -up; press_enter_to_continue ;;
+                manage_ip_configuration ;;
             2)
-                change_hostname ;;
+                pihole -up; press_enter_to_continue ;;
             3)
-                manage_teleporter ;;
+                change_hostname ;;
             4)
+                manage_teleporter ;;
+            5)
                 clear
                 echo -e "${RED}WARNING:${NC} This will permanently delete your query logs and clear the network table."
                 read -p "Are you sure you want to continue? (y/N): " confirm
@@ -336,17 +375,17 @@ system_and_maintenance() {
                 fi
                 press_enter_to_continue
                 ;;
-            5)
-                pihole -d; press_enter_to_continue ;;
             6)
+                pihole -d; press_enter_to_continue ;;
+            7)
                 read -p "Are you sure you want to REBOOT the system? (y/N): " confirm
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then sudo reboot; fi
                 ;;
-            7)
+            8)
                 read -p "Are you sure you want to SHUT DOWN the system? (y/N): " confirm
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then sudo shutdown now; fi
                 ;;
-            8)
+            9)
                 break ;;
             *)
                 echo -e "${RED}Invalid option. Please try again.${NC}"; sleep 1 ;;
@@ -377,7 +416,7 @@ check_dependency "jq"
 while true; do
     clear
     echo "======================================================"
-    echo "       Pi-hole Admin Toolkit v3.0 (Final)"
+    echo "    Pi-hole Admin Toolkit v4.0 (Definitive Edition)"
     echo "======================================================"
     echo -e " ${YELLOW}1)${NC} Health Dashboard"
     echo -e " ${YELLOW}2)${NC} Live Stats (Chronometer)"
