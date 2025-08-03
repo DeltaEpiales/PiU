@@ -1,13 +1,15 @@
 #!/bin/bash
 
-# Pi-hole Admin Toolkit
-# A comprehensive, menu-driven script for managing a Pi-hole instance.
+# Pi-hole Admin Toolkit v3.0 (Final)
+# A comprehensive, menu-driven script for managing and troubleshooting a Pi-hole instance.
+# Enhanced with a guided setup, error checking, and advanced utilities.
 
 # --- Color Definitions ---
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
 NC='\033[0m' # No Color
 
 # --- Helper Functions ---
@@ -15,6 +17,75 @@ press_enter_to_continue() {
     echo -e "\n${YELLOW}Press [Enter] to return to the menu...${NC}"
     read -r
 }
+
+check_dependency() {
+    if ! command -v "$1" &> /dev/null; then
+        echo -e "${YELLOW}Warning: Command '$1' not found. Some features may not work.${NC}"
+        read -p "Do you want to try and install it now? (y/N): " choice
+        if [[ "$choice" =~ ^[Yy]$ ]]; then
+            sudo apt-get update && sudo apt-get install -y "$1"
+        fi
+    fi
+}
+
+# --- Guided Configuration ---
+run_guided_configuration() {
+    clear
+    echo "========================================"
+    echo "  Pi-hole Guided Configuration"
+    echo "========================================"
+    echo "This wizard will help you check and fix common setup issues."
+
+    # 1. Check Static IP
+    echo -e "\n${BLUE}Step 1: Checking Network Configuration...${NC}"
+    if ! grep -q "static ip_address" /etc/dhcpcd.conf; then
+        echo -e "${YELLOW}Warning: Your Pi-hole does not appear to have a static IP set in /etc/dhcpcd.conf.${NC}"
+        echo "A static IP is crucial for Pi-hole to function correctly."
+        read -p "Would you like to run the Pi-hole reconfigure tool to set one now? (y/N): " choice
+        if [[ "$choice" =~ ^[Yy]$ ]]; then
+            pihole -r
+            echo "Please re-run this script after the reconfiguration is complete."
+            exit 0
+        fi
+    else
+        echo -e "${GREEN}Static IP configuration found in /etc/dhcpcd.conf.${NC}"
+    fi
+
+    # 2. Check Upstream DNS
+    echo -e "\n${BLUE}Step 2: Checking Upstream DNS Servers...${NC}"
+    upstream_dns=$(grep 'PIHOLE_DNS_' /etc/pihole/setupVars.conf | cut -d'=' -f2)
+    if [[ -z "$upstream_dns" ]]; then
+        echo -e "${RED}Error: No upstream DNS servers are configured!${NC}"
+        echo "Pi-hole needs at least one upstream DNS server to resolve domains."
+        read -p "Would you like to run the Pi-hole reconfigure tool to set them now? (y/N): " choice
+        if [[ "$choice" =~ ^[Yy]$ ]]; then
+            pihole -r
+            echo "Please re-run this script after the reconfiguration is complete."
+            exit 0
+        fi
+    else
+        echo -e "${GREEN}Upstream DNS servers found:${NC}\n$upstream_dns"
+    fi
+    
+    # 3. Check DHCP Server Status
+    echo -e "\n${BLUE}Step 3: Checking DHCP Server...${NC}"
+    if grep -q 'DHCP_ACTIVE=true' /etc/pihole/setupVars.conf; then
+        echo -e "${GREEN}Pi-hole's DHCP server is enabled.${NC}"
+        dhcp_start=$(grep 'DHCP_START' /etc/pihole/setupVars.conf | cut -d'=' -f2)
+        dhcp_end=$(grep 'DHCP_END' /etc/pihole/setupVars.conf | cut -d'=' -f2)
+        dhcp_router=$(grep 'DHCP_ROUTER' /etc/pihole/setupVars.conf | cut -d'=' -f2)
+        echo "DHCP Range: $dhcp_start to $dhcp_end"
+        echo "Gateway: $dhcp_router"
+        echo -e "${YELLOW}Important: Make sure you have disabled the DHCP server on your main router!${NC}"
+    else
+        echo -e "${BLUE}Pi-hole's DHCP server is disabled.${NC}"
+        echo "Ensure your router's DHCP settings are pointing to this Pi-hole's IP for DNS."
+    fi
+
+    echo -e "\n${GREEN}Guided configuration check complete!${NC}"
+    press_enter_to_continue
+}
+
 
 # --- Core Functions ---
 
@@ -24,25 +95,9 @@ show_dashboard() {
     echo "  Pi-hole Health Dashboard"
     echo "========================================"
     
-    # Service Status
-    if pihole status | grep -q "DNS service is running"; then
-        echo -e "Service Status:  [  ${GREEN}OK${NC}  ] FTL is running"
-    else
-        echo -e "Service Status:  [ ${RED}FAIL${NC} ] FTL is not running"
-    fi
-
-    # Blocking Status
-    if pihole status | grep -q "Blocking is enabled"; then
-        echo -e "Blocking Status: [  ${GREEN}OK${NC}  ] Enabled"
-    else
-        echo -e "Blocking Status: [ ${YELLOW}WARN${NC} ] Disabled"
-    fi
+    pihole status
     
-    # Gravity Info
-    gravity_last_updated=$(pihole -g -q | grep "days old")
-    echo -e "Gravity DB:      [ ${BLUE}INFO${NC} ] $gravity_last_updated"
-    
-    # System Vitals
+    echo -e "\n--- System Vitals ---"
     disk_usage=$(df -h / | awk 'NR==2 {print $5}')
     echo -e "Disk Usage:      [ ${BLUE}INFO${NC} ] $disk_usage used"
     if command -v vcgencmd &> /dev/null; then
@@ -52,11 +107,61 @@ show_dashboard() {
     press_enter_to_continue
 }
 
+show_chronometer() {
+    clear
+    echo "Showing live stats... Press Ctrl+C to exit."
+    pihole chronometer
+    press_enter_to_continue
+}
+
 manage_gravity() {
     clear
     echo "Updating Gravity... this may take a moment."
     pihole -g
     echo -e "\n${GREEN}Gravity update complete.${NC}"
+    press_enter_to_continue
+}
+
+audit_adlists() {
+    clear
+    echo "--- Auditing Adlists ---"
+    ADLIST_FILE="/etc/pihole/adlists.list"
+
+    # Check for duplicates
+    duplicates=$(sort "$ADLIST_FILE" | uniq -d)
+    if [[ -n "$duplicates" ]]; then
+        echo -e "${YELLOW}Duplicate adlists found:${NC}"
+        echo "$duplicates"
+        read -p "Do you want to remove these duplicates? (y/N): " choice
+        if [[ "$choice" =~ ^[Yy]$ ]]; then
+            echo "Backing up adlists to ${ADLIST_FILE}.bak"
+            sudo cp "$ADLIST_FILE" "${ADLIST_FILE}.bak"
+            sort -u "$ADLIST_FILE" -o "$ADLIST_FILE"
+            echo "Duplicates removed."
+        fi
+    else
+        echo -e "${GREEN}No duplicate adlists found.${NC}"
+    fi
+
+    # Check for unreachable lists
+    echo -e "\n--- Checking adlist availability (this may take a while) ---"
+    unreachable_count=0
+    while IFS= read -r line; do
+        if [[ -n "$line" && ! "$line" =~ ^# ]]; then
+            # Use curl to check the HTTP status code
+            status_code=$(curl -o /dev/null --silent --head --write-out '%{http_code}' --max-time 10 "$line")
+            if [[ "$status_code" -ne 200 ]]; then
+                echo -e "${RED}Unreachable:${NC} $line (Status: $status_code)"
+                unreachable_count=$((unreachable_count + 1))
+            fi
+        fi
+    done < "$ADLIST_FILE"
+
+    if [[ "$unreachable_count" -eq 0 ]]; then
+        echo -e "\n${GREEN}All adlists are reachable.${NC}"
+    else
+        echo -e "\n${YELLOW}Found $unreachable_count unreachable adlist(s). Consider removing them from ${ADLIST_FILE}.${NC}"
+    fi
     press_enter_to_continue
 }
 
@@ -70,35 +175,40 @@ manage_lists() {
         echo "2. Blacklist a domain"
         echo "3. Add a new Adlist URL"
         echo "4. Search for a domain in adlists"
-        echo "5. Back to Main Menu"
+        echo -e "${PURPLE}5. Audit Adlists (Check for duplicates & dead links)${NC}"
+        echo "6. Back to Main Menu"
         echo "----------------------------------------"
-        read -p "Enter your choice [1-5]: " choice
+        read -p "Enter your choice [1-6]: " choice
 
         case $choice in
             1)
                 read -p "Enter domain to whitelist: " domain
-                pihole -w "$domain"
+                if [[ -n "$domain" ]]; then pihole -w "$domain"; fi
                 press_enter_to_continue
                 ;;
             2)
                 read -p "Enter domain to blacklist: " domain
-                pihole -b "$domain"
+                if [[ -n "$domain" ]]; then pihole -b "$domain"; fi
                 press_enter_to_continue
                 ;;
             3)
                 read -p "Enter the full URL of the adlist: " adlist_url
-                # Add the new URL to the adlists file
-                echo "$adlist_url" | sudo tee -a /etc/pihole/adlists.list > /dev/null
-                echo "Adlist added to /etc/pihole/adlists.list."
-                echo "Remember to Update Gravity to apply changes."
+                if [[ -n "$adlist_url" ]]; then
+                    echo "$adlist_url" | sudo tee -a /etc/pihole/adlists.list > /dev/null
+                    echo "Adlist added to /etc/pihole/adlists.list."
+                    echo "Remember to Update Gravity to apply changes."
+                fi
                 press_enter_to_continue
                 ;;
             4)
                 read -p "Enter domain to search for: " domain
-                pihole --query-adlists "$domain"
+                if [[ -n "$domain" ]]; then pihole --query-adlists "$domain"; fi
                 press_enter_to_continue
                 ;;
             5)
+                audit_adlists
+                ;;
+            6)
                 break
                 ;;
             *)
@@ -117,39 +227,45 @@ network_and_log_tools() {
         echo "========================================"
         echo "1. View Live Query Log (pihole -t)"
         echo "2. View Important Log & Config Files"
-        echo "3. Show Top Clients & Blocked Domains"
-        echo "4. Scan network for active clients (arp-scan)"
-        echo "5. Back to Main Menu"
+        echo "3. Show Top Clients & Blocked Domains (Last 24h)"
+        echo "4. Query a specific client's recent activity"
+        echo "5. Scan network for active clients"
+        echo "6. Back to Main Menu"
         echo "----------------------------------------"
-        read -p "Enter your choice [1-5]: " choice
+        read -p "Enter your choice [1-6]: " choice
 
         case $choice in
             1)
-                clear
-                echo "Tailing Pi-hole log... Press Ctrl+C to stop."
-                pihole -t
-                press_enter_to_continue
-                ;;
+                clear; echo "Tailing Pi-hole log... Press Ctrl+C to stop."; pihole -t; press_enter_to_continue ;;
             2) view_files ;;
             3)
                 clear
-                echo "--- Top 10 Clients ---"
-                echo "SELECT client, count(client) FROM queries GROUP BY client ORDER BY count(client) DESC LIMIT 10;" | sudo sqlite3 /etc/pihole/pihole-FTL.db
-                echo -e "\n--- Top 10 Blocked Domains ---"
-                pihole -c -t 10
+                echo "--- Top 10 Clients (Last 24h) ---"
+                echo "SELECT client, count(client) FROM queries WHERE timestamp >= strftime('%s','now','-24 hours') GROUP BY client ORDER BY count(client) DESC LIMIT 10;" | sudo sqlite3 /etc/pihole/pihole-FTL.db
+                echo -e "\n--- Top 10 Blocked Domains (Last 24h) ---"
+                echo "SELECT domain, count(domain) FROM queries WHERE status IN (1,4,5,6,7,8,9,10,11) AND timestamp >= strftime('%s','now','-24 hours') GROUP BY domain ORDER BY count(domain) DESC LIMIT 10;" | sudo sqlite3 /etc/pihole/pihole-FTL.db
                 press_enter_to_continue
                 ;;
             4)
+                read -p "Enter client IP address to query: " client_ip
+                if [[ -n "$client_ip" ]]; then
+                    clear
+                    echo "--- Recent queries for $client_ip (last 100) ---"
+                    echo "SELECT timestamp, type, domain, status FROM queries WHERE client='$client_ip' ORDER BY timestamp DESC LIMIT 100;" | sqlite3 /etc/pihole/pihole-FTL.db
+                fi
+                press_enter_to_continue
+                ;;
+            5)
                 clear
                 if command -v arp-scan &> /dev/null; then
                     sudo arp-scan --localnet
                 else
-                    echo -e "${YELLOW}arp-scan is not installed. Please install it with:${NC}"
-                    echo "sudo apt update && sudo apt install arp-scan"
+                    echo -e "${YELLOW}arp-scan not found. Using pihole's network table as a fallback.${NC}"
+                    pihole -c -j | jq -r '.network | .[] | "IP: \(.ip) | MAC: \(.mac) | Name: \(.name[0])"'
                 fi
                 press_enter_to_continue
                 ;;
-            5) break ;;
+            6) break ;;
             *) echo -e "${RED}Invalid option. Please try again.${NC}"; sleep 1 ;;
         esac
     done
@@ -171,7 +287,6 @@ view_files() {
         echo "----------------------------------------"
         read -p "Enter your choice [1-7]: " choice
         
-        # Use 'less' for easy viewing. Press 'q' to exit viewer.
         case $choice in
             1) less /var/log/pihole/pihole.log ;;
             2) less /var/log/pihole/pihole-FTL.log ;;
@@ -185,121 +300,6 @@ view_files() {
     done
 }
 
-control_services() {
-    while true; do
-        clear
-        echo "========================================"
-        echo "  Service Control"
-        echo "========================================"
-        echo "1. Enable Pi-hole blocking"
-        echo "2. Disable Pi-hole blocking (for 30 seconds)"
-        echo "3. Disable Pi-hole blocking (for 5 minutes)"
-        echo "4. Restart DNS resolver (pihole restartdns)"
-        echo "5. Back to Main Menu"
-        echo "----------------------------------------"
-        read -p "Enter your choice [1-5]: " choice
-
-        case $choice in
-            1)
-                pihole enable
-                echo -e "${GREEN}Pi-hole enabled.${NC}"
-                press_enter_to_continue
-                ;;
-            2)
-                pihole disable 30s
-                echo -e "${YELLOW}Pi-hole disabled for 30 seconds.${NC}"
-                press_enter_to_continue
-                ;;
-            3)
-                pihole disable 5m
-                echo -e "${YELLOW}Pi-hole disabled for 5 minutes.${NC}"
-                press_enter_to_continue
-                ;;
-            4)
-                pihole restartdns
-                echo -e "${GREEN}DNS resolver restarted.${NC}"
-                press_enter_to_continue
-                ;;
-            5)
-                break
-                ;;
-            *)
-                echo -e "${RED}Invalid option. Please try again.${NC}"
-                sleep 1
-                ;;
-        esac
-    done
-}
-
-change_hostname() {
-    clear
-    current_hostname=$(hostname)
-    echo "Current system hostname is: $current_hostname"
-    read -p "Enter the new hostname: " new_hostname
-
-    if [[ -z "$new_hostname" ]]; then
-        echo -e "${RED}Hostname cannot be empty.${NC}"
-        press_enter_to_continue
-        return
-    fi
-    
-    echo -e "\n${RED}WARNING:${NC} This will change the system hostname from '$current_hostname' to '$new_hostname'."
-    echo "This requires a system reboot to take full effect."
-    read -p "Are you sure you want to continue? (y/N): " confirm
-
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        echo "Changing hostname..."
-        sudo hostnamectl set-hostname "$new_hostname"
-        sudo sed -i "s/127.0.1.1.*$current_hostname/127.0.1.1\t$new_hostname/g" /etc/hosts
-        echo -e "${GREEN}Hostname changed. Please reboot your system for changes to apply fully.${NC}"
-        echo "You may also need to run 'pihole -r' and choose 'Reconfigure' after rebooting."
-    else
-        echo "Hostname change cancelled."
-    fi
-    press_enter_to_continue
-}
-
-manage_teleporter() {
-    while true; do
-        clear
-        echo "========================================"
-        echo "  Backup & Restore (Teleporter)"
-        echo "========================================"
-        echo "1. Create a new backup"
-        echo "2. Restore from a backup file"
-        echo "3. Back to Previous Menu"
-        echo "----------------------------------------"
-        read -p "Enter your choice [1-3]: " choice
-
-        case $choice in
-            1)
-                backup_file="teleporter_$(date +%Y-%m-%d_%H-%M-%S).tar.gz"
-                pihole -a -t "$backup_file"
-                echo -e "\n${GREEN}Backup created at: $(pwd)/$backup_file${NC}"
-                press_enter_to_continue
-                ;;
-            2)
-                read -p "Enter the full path to the teleporter backup file (.tar.gz): " restore_file
-                if [[ -f "$restore_file" ]]; then
-                    echo -e "${RED}WARNING:${NC} This will overwrite your current Pi-hole settings."
-                    read -p "Are you sure you want to restore from '$restore_file'? (y/N): " confirm_restore
-                    if [[ "$confirm_restore" =~ ^[Yy]$ ]]; then
-                        pihole -a -t "$restore_file"
-                    else
-                        echo "Restore cancelled."
-                    fi
-                else
-                    echo -e "${RED}Error: Backup file not found at '$restore_file'${NC}"
-                fi
-                press_enter_to_continue
-                ;;
-            3) break ;;
-            *) echo -e "${RED}Invalid option. Please try again.${NC}"; sleep 1 ;;
-        esac
-    done
-}
-
-
 system_and_maintenance() {
      while true; do
         clear
@@ -309,70 +309,98 @@ system_and_maintenance() {
         echo "1. Update Pi-hole software (pihole -up)"
         echo "2. Change Pi-hole Hostname"
         echo "3. Backup / Restore Pi-hole (Teleporter)"
-        echo "4. Run a debug session (pihole -d)"
-        echo "5. Back to Main Menu"
+        echo -e "${PURPLE}4. Flush Pi-hole Logs & Network Table${NC}"
+        echo "5. Run a debug session (pihole -d)"
+        echo -e "${RED}6. Reboot System${NC}"
+        echo -e "${RED}7. Shutdown System${NC}"
+        echo "8. Back to Main Menu"
         echo "----------------------------------------"
-        read -p "Enter your choice [1-5]: " choice
+        read -p "Enter your choice [1-8]: " choice
 
         case $choice in
             1)
-                pihole -up
-                press_enter_to_continue
-                ;;
+                pihole -up; press_enter_to_continue ;;
             2)
-                change_hostname
-                ;;
+                change_hostname ;;
             3)
-                manage_teleporter
-                ;;
+                manage_teleporter ;;
             4)
-                pihole -d
+                clear
+                echo -e "${RED}WARNING:${NC} This will permanently delete your query logs and clear the network table."
+                read -p "Are you sure you want to continue? (y/N): " confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    pihole -f
+                    echo "Network table cleared."
+                else
+                    echo "Operation cancelled."
+                fi
                 press_enter_to_continue
                 ;;
             5)
-                break
+                pihole -d; press_enter_to_continue ;;
+            6)
+                read -p "Are you sure you want to REBOOT the system? (y/N): " confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then sudo reboot; fi
                 ;;
+            7)
+                read -p "Are you sure you want to SHUT DOWN the system? (y/N): " confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then sudo shutdown now; fi
+                ;;
+            8)
+                break ;;
             *)
-                echo -e "${RED}Invalid option. Please try again.${NC}"
-                sleep 1
-                ;;
+                echo -e "${RED}Invalid option. Please try again.${NC}"; sleep 1 ;;
         esac
     done
 }
 
-# --- Main Menu ---
+# --- Main Execution ---
+
+# Check for root privileges
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}This script uses commands that require root privileges.${NC}" 
+   echo "Please run it with sudo: sudo ./pihole_toolkit.sh"
+   exit 1
+fi
+
+# Check for --configure flag
+if [[ "$1" == "--configure" ]]; then
+    run_guided_configuration
+    exit 0
+fi
+
+# Check for required dependencies
+check_dependency "arp-scan"
+check_dependency "sqlite3"
+check_dependency "jq"
+
 while true; do
     clear
-    echo "========================================"
-    echo "       Pi-hole Admin Toolkit"
-    echo "========================================"
-    echo -e "What would you like to do?"
-    echo -e " ${YELLOW}1)${NC} View Health Dashboard"
-    echo -e " ${YELLOW}2)${NC} Update Gravity (Adlists)"
-    echo -e " ${YELLOW}3)${NC} Manage Whitelist / Blacklist / Adlists"
-    echo -e " ${YELLOW}4)${NC} Network & Log Tools"
-    echo -e " ${YELLOW}5)${NC} Service Control (Enable/Disable/Restart)"
+    echo "======================================================"
+    echo "       Pi-hole Admin Toolkit v3.0 (Final)"
+    echo "======================================================"
+    echo -e " ${YELLOW}1)${NC} Health Dashboard"
+    echo -e " ${YELLOW}2)${NC} Live Stats (Chronometer)"
+    echo -e " ${YELLOW}3)${NC} Update Gravity (Adlists)"
+    echo -e " ${YELLOW}4)${NC} Manage Whitelist / Blacklist / Adlists"
+    echo -e " ${YELLOW}5)${NC} Network & Log Tools"
     echo -e " ${YELLOW}6)${NC} System & Maintenance"
-    echo "----------------------------------------"
+    echo "------------------------------------------------------"
+    echo -e " ${BLUE}Tip: Run with '--configure' for a guided setup check.${NC}"
     echo -e " ${RED}7)${NC} Exit"
-    echo "========================================"
+    echo "======================================================"
     read -p "Enter your choice [1-7]: " main_choice
 
     case $main_choice in
         1) show_dashboard ;;
-        2) manage_gravity ;;
-        3) manage_lists ;;
-        4) network_and_log_tools ;;
-        5) control_services ;;
+        2) show_chronometer ;;
+        3) manage_gravity ;;
+        4) manage_lists ;;
+        5) network_and_log_tools ;;
         6) system_and_maintenance ;;
         7)
-            clear
-            echo "Exiting Pi-hole Admin Toolkit. Goodbye!"
-            exit 0
-            ;;
+            clear; echo "Exiting Pi-hole Admin Toolkit. Goodbye!"; exit 0 ;;
         *)
-            echo -e "${RED}Invalid option. Please try again.${NC}"
-            sleep 1
-            ;;
+            echo -e "${RED}Invalid option. Please try again.${NC}"; sleep 1 ;;
     esac
 done
